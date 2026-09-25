@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from ber.candidates import generate
 from ber.evaluation import assemble, entity_score, splits
@@ -7,6 +8,7 @@ from ber.export import export, package
 from ber.features import build_features
 from ber.normalization import normalize, preprocess
 from ber.loading import stream_select
+from ber.training import fit_model, probability
 
 
 CONFIG = {"top_k": 2, "batch_size": 2, "threads": 1, "rare_max_df": 3, "rare_tokens": 2,
@@ -95,3 +97,19 @@ def test_repackage_has_no_duplicate_artifacts(tmp_path):
     with zipfile.ZipFile(package(project, run)) as archive:
         assert len(archive.namelist()) == len(set(archive.namelist()))
         assert archive.read("code/business_entity_resolution/artifacts/model.txt") == b"new"
+
+
+@pytest.mark.parametrize("kind", ["lightgbm", "xgboost"])
+def test_both_backends_save_and_reload(kind, tmp_path):
+    import joblib
+    features = pd.DataFrame(np.random.default_rng(42).normal(size=(100, 3)),
+                            columns=["name_similarity", "address_similarity", "country_agreement"])
+    y = (features.name_similarity > 0).astype(int).to_numpy()
+    config = {**CONFIG, "n_estimators": 3, "num_leaves": 4, "learning_rate": .1,
+              "hard_negative_weight": 2., "device": "cpu"}
+    model = fit_model(kind, features, y, config, hard=True)
+    before = probability(model, features)
+    joblib.dump(model, tmp_path / f"{kind}.joblib")
+    loaded = joblib.load(tmp_path / f"{kind}.joblib")
+    np.testing.assert_allclose(before, probability(loaded, features))
+    assert np.isfinite(before).all() and ((before >= 0) & (before <= 1)).all()

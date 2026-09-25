@@ -34,8 +34,58 @@ inference instructions are in the pipeline README.
 
 These are execution checks on a deliberately small and easier candidate pool,
 not competition performance estimates. The full dataset pipeline has not been
-run. Full-run runtime, memory and 99% blocking recall remain unverified. All final
-candidate pairs/features are currently held in memory, so full-scale execution may
-need substantial RAM. Threshold/model selection scores reuse OOF predictions;
+completed by the agent. Full-run runtime, memory and 99% blocking recall remain
+unverified. The original memory execution retains full candidate/feature tables;
+the disk extension below addresses that limitation. Threshold/model selection scores reuse OOF predictions;
 country stress results also reuse the global threshold and are diagnostic only.
 The smoke ZIP is not a leaderboard submission.
+
+## GPU comparison extension
+
+Both LightGBM and XGBoost are now retained and compared on identical candidate
+rows, features, entity folds and hard-negative weights. Default configuration uses
+CPU for both. `config/gpu.json` uses CPU LightGBM and CUDA XGBoost; the local
+LightGBM wheel lacks its GPU tree learner. XGBoost 3.4.1 was available as a cached
+Windows wheel and was installed with `uv pip --offline`, without downloading.
+Actual CUDA training was confirmed on the RTX 3050 laptop GPU with 6 GB VRAM.
+
+The same 80-entity smoke fixture gave full-model OOF selection macro F0.5 of
+0.978240 for LightGBM and 0.980917 for XGBoost. Nine correctness tests pass. Both
+models, independent frozen thresholds, OOF scores, errors and validated prediction
+files are preserved in `runs/gpu_comparison/`; `reports/experiments.tsv` compares
+metrics and fit timings. These tiny-sample results do not establish a general
+quality advantage or GPU speedup. CPU/system RAM is still used for loading,
+preprocessing, candidate generation and feature construction.
+
+## Resumable disk preprocessing
+
+The user's full run was stopped with permission after it reached approximately
+29 GiB committed memory on a 16 GiB machine. Existing whole-frame caches remain
+intact. Normalization now streams into reusable compressed Parquet partitions,
+commits after each chunk, validates duplicate IDs with a disk-backed SQLite
+index, and resumes after interruption. Unchanged files can be reused across
+output directories and CPU/GPU/model settings without normalization. PyArrow and
+filelock were installed offline from the local cache.
+
+`--prepare-only` prepares disk checkpoints without training. Disk execution now
+also uses SQLite retrieval indexes, mapped sparse TF-IDF postings and feature
+arrays, partitioned candidate features and scores, streaming metrics/export,
+LightGBM Sequence ingestion and XGBoost disk external-memory training. Completed
+folds and final models are reusable across output directories. Disk execution
+compares both full boosted models; extra minimal baselines and country holdout
+experiments remain in memory execution.
+
+Twenty-one tests pass, covering normalization interruption/resume, invalidation,
+retrieval/feature parity, mapped-buffer preservation, streaming metrics and native
+model checkpoint reloads. The 80-query disk run in `runs/disk_pipeline_verified`
+retrieves 261/261 true pairs. OOF selection macro F0.5 is 0.972393 for CPU LightGBM
+and 0.980322 for CUDA XGBoost, with thresholds 0.59 and 0.66. Both test exports pass
+streaming and supplied official validation. These are small-sample diagnostics.
+Another output directory reused all normalization, index, feature and trained-fold
+checkpoints. Separately loaded LightGBM and XGBoost models reproduced both output
+TSVs byte-for-byte; hashes are in the run's `reports/reproduction.json`.
+
+No full-data training was restarted. Compressed LightGBM bins, labels, gradients
+and GPU working buffers still need RAM/VRAM. Capacity estimates are not strict OS
+limits, and full-dataset operation on 16 GB remains unverified. See the pipeline
+README for preparation, resume, explicit query sampling and memory limits.

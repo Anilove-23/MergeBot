@@ -1,7 +1,8 @@
 {
   "seed": 42,
   "boosted_models": ["lightgbm", "xgboost"],
-  "device": "cpu",
+  "device": "cuda:0",
+  "max_bin": 64,
   "folds": 3,
   "top_k": 30,
   "batch_size": 256,

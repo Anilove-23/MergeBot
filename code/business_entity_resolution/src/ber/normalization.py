@@ -19,10 +19,10 @@ def address_tokens(value):
     return frozenset(re.findall(r"\b\w*\d\w*\b", value))
 
 
-def preprocess(frame):
+def preprocess(frame, progress=True):
     frame = frame.copy()
     for raw, short in tqdm([("business_name", "name"), ("business_address", "address")],
-                           desc="Normalize fields", leave=False):
+                           desc="Normalize fields", leave=False, disable=not progress):
         frame[short] = frame[raw].map(normalize)
         frame[f"{short}_folded"] = frame[short].map(fold_accents)
     frame["name_core"] = frame.name.map(lambda s: " ".join(sorted(SUFFIXES.sub(" ", s).split())))

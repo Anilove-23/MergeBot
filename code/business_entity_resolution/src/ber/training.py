@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 from lightgbm import LGBMClassifier
 from sklearn.dummy import DummyClassifier
@@ -21,19 +23,52 @@ def fit_model(kind, features, y, config, hard=False):
     if kind == "logistic":
         model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, random_state=config["seed"]))
         model.fit(features, y, logisticregression__sample_weight=weight)
-    else:
+    elif kind == "xgboost":
+        from xgboost import XGBClassifier
+        from xgboost.callback import TrainingCallback
+
+        device = config.get("device", "cpu")
+        with tqdm(total=config["n_estimators"], desc=f"XGBoost {device} iterations", leave=False) as bar:
+            class Progress(TrainingCallback):
+                def after_iteration(self, model, epoch, evals_log):
+                    bar.update(1)
+                    return False
+
+            model = XGBClassifier(
+                device=device, tree_method="hist", max_bin=config.get("max_bin", 64),
+                n_estimators=config["n_estimators"], learning_rate=config["learning_rate"],
+                grow_policy="lossguide", max_leaves=config["num_leaves"], max_depth=0,
+                random_state=config["seed"], n_jobs=config["threads"],
+                objective="binary:logistic", eval_metric="logloss", callbacks=[Progress()],
+            )
+            model.fit(features, y, sample_weight=weight, verbose=False)
+        # Do not serialize callbacks containing terminal handles.
+        model.set_params(callbacks=None)
+        actual = json.loads(model.get_booster().save_config())["learner"]["generic_param"]["device"]
+        if device.startswith("cuda") and not actual.startswith("cuda"):
+            raise RuntimeError(f"CUDA training requested, but XGBoost used {actual}; refusing silent CPU fallback")
+        model.training_device_ = actual
+        tqdm.write(f"XGBoost training device confirmed: {actual}")
+    elif kind == "lightgbm":
         model = LGBMClassifier(n_estimators=config["n_estimators"], num_leaves=config["num_leaves"],
                                learning_rate=config["learning_rate"], random_state=config["seed"],
                                n_jobs=config["threads"], verbosity=-1, deterministic=True,
                                force_col_wise=True, min_child_samples=10)
         with tqdm(total=config["n_estimators"], desc="LightGBM iterations", leave=False) as bar:
             model.fit(features, y, sample_weight=weight, callbacks=[lambda env: bar.update(1)])
+    else:
+        raise ValueError(f"Unsupported model backend: {kind}")
     return model
 
 
 def probability(model, features):
     if features.empty:
         return np.empty(0)
+    if hasattr(model, "get_booster"):
+        from xgboost import DMatrix
+        # Features are CPU-resident. Use the explicit transfer/prediction API
+        # instead of inplace_predict, which expects matching input/model devices.
+        return model.get_booster().predict(DMatrix(features))
     classes = list(model.classes_)
     if 1 not in classes:
         return np.zeros(len(features))
@@ -66,7 +101,7 @@ def country_stress(queries, targets, pairs, features, y, truth, config, threshol
         if not train.any() or qvalid.empty:
             reports[f"{origin}->{destination}"] = {"skipped": "Insufficient sampled country records"}
             continue
-        model = fit_model("lightgbm", features.loc[train], y[train], config, hard=True)
+        model = fit_model(config.get("boosted_model", "lightgbm"), features.loc[train], y[train], config, hard=True)
         selected = pairs.loc[valid]
         predictions = assemble(queries, targets, selected, probability(model, features.loc[valid]), threshold)
         reports[f"{origin}->{destination}"] = metrics(qvalid, truth, predictions)

@@ -1,0 +1,1 @@
+"""Offline business entity resolution."""

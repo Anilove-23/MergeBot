@@ -1,0 +1,13 @@
+{
+  "seed": 42,
+  "folds": 3,
+  "top_k": 30,
+  "batch_size": 256,
+  "rare_max_df": 100,
+  "rare_tokens": 3,
+  "n_estimators": 200,
+  "num_leaves": 15,
+  "learning_rate": 0.05,
+  "hard_negative_weight": 2.0,
+  "threads": 4
+}

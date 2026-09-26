@@ -37,7 +37,7 @@ def indexed(tmp_path):
     pd.DataFrame([('S1-a', 'S2-a,S3-a'), ('S1-b', 'S2-b'), ('S1-c', '')], columns=['source1_entity_id', 'matched_entity_ids']).to_csv(root / 'train/train_ground_truth.tsv', sep='\t', index=False)
     cache = tmp_path / 'cache'
     prepared = prepare_dataset(root, cache, chunk_rows=2)
-    index = build_index(prepared, 'train', root, cache)
+    index = build_index(prepared, 'train', root, cache, {'index_workers': 1})
     yield root, cache, prepared, index
     index.close()
 
@@ -120,7 +120,9 @@ def test_disk_training_save_and_checkpoint(indexed, kind):
     model = fit_disk(kind, matrix, CONFIG, budget_gb=1.)
     features = next(store.frames())
     prediction = model.predict_proba(features)
-    reused = fit_disk(kind, matrix, CONFIG, budget_gb=1.)
+    checkpoints = list(matrix.directory.rglob('model.joblib'))
+    reused = fit_disk(kind, matrix, {**CONFIG, 'index_workers': 2, 'index_cache_mb': 128}, budget_gb=1.)
+    assert list(matrix.directory.rglob('model.joblib')) == checkpoints
     np.testing.assert_allclose(prediction, reused.predict_proba(features))
     assert prediction.shape == (len(features), 2)
 
@@ -132,3 +134,60 @@ def test_query_subset_preserves_target_pool(indexed):
     selected = [q for part in store.parts() for q in store.query_metadata(part)]
     assert len(selected) == 2
     assert index.db.execute('SELECT COUNT(*) FROM records').fetchone()[0] == target_count
+
+
+def test_parallel_index_resume_matches_serial(indexed, tmp_path, monkeypatch):
+    import ber.disk_index as module
+    from ber.disk_cache import NormalizedFile
+    root, _, prepared, serial = indexed
+    parallel_cache = tmp_path / 'parallel'
+    original = module._prepared_chunks
+
+    def interrupted(*args):
+        stream = original(*args)
+        try:
+            yield next(stream)
+            raise RuntimeError('simulated interruption after one committed chunk')
+        finally:
+            stream.close()
+
+    monkeypatch.setattr(module, '_prepared_chunks', interrupted)
+    with pytest.raises(RuntimeError, match='simulated interruption'):
+        build_index(prepared, 'train', root, parallel_cache, {'index_workers': 2})
+    monkeypatch.setattr(module, '_prepared_chunks', original)
+    read_starts = []
+    original_batches = NormalizedFile.iter_batches
+
+    def track(self, *args, **kwargs):
+        read_starts.append((self.directory, kwargs.get('start_row', 0)))
+        yield from original_batches(self, *args, **kwargs)
+
+    monkeypatch.setattr(NormalizedFile, 'iter_batches', track)
+    parallel = build_index(prepared, 'train', root, parallel_cache, {'index_workers': 2})
+    try:
+        for table in ['records', 'tokens', 'numbers', 'terms', 'token_counts', 'queries', 'truth', 'owners']:
+            assert sorted(serial.db.execute(f'SELECT * FROM {table}').fetchall()) == sorted(parallel.db.execute(f'SELECT * FROM {table}').fetchall())
+        assert (prepared['train_source2'].directory, 2) in read_starts
+    finally:
+        parallel.close()
+
+
+def test_model_tuning_reuses_index_and_features(indexed, monkeypatch):
+    import ber.disk_index as module
+    root, cache, prepared, index = indexed
+    store = prepare_features(index, CONFIG, cache)
+    before = (store.directory / 'manifest.json').stat().st_mtime_ns
+    changed = {**CONFIG, 'n_estimators': 100, 'learning_rate': .02, 'num_leaves': 31,
+               'max_bin': 128, 'device': 'cuda:0', 'index_workers': 3, 'index_cache_mb': 64}
+
+    def fail(*args):
+        raise AssertionError('Model tuning must not rebuild indexing')
+
+    monkeypatch.setattr(module, '_prepared_chunks', fail)
+    reused = build_index(prepared, 'train', root, cache, changed)
+    try:
+        assert reused.directory == index.directory
+        assert prepare_features(reused, changed, cache).directory == store.directory
+        assert (store.directory / 'manifest.json').stat().st_mtime_ns == before
+    finally:
+        reused.close()

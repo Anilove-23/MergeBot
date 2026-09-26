@@ -17,7 +17,7 @@ def overlap(a, b):
     return len(a & b) / len(a | b) if a or b else 0.0
 
 
-def build_features(queries, targets, pairs, config, vectorizers=None, name_frequencies=None, candidate_counts=None):
+def build_features(queries, targets, pairs, config, vectorizers=None, name_frequencies=None, candidate_counts=None, query_matrices=None):
     left = queries.iloc[pairs.q.to_numpy()].reset_index(drop=True)
     right = targets.iloc[pairs.t.to_numpy()].reset_index(drop=True)
     values = {}
@@ -27,7 +27,8 @@ def build_features(queries, targets, pairs, config, vectorizers=None, name_frequ
             left[field].tolist(), right[field].tolist(), scorer=fuzz.ratio,
             workers=config["threads"], dtype=np.float32) / 100 * valid.to_numpy()
         values[f"{field}_exact"] = (left[field].eq(right[field]) & valid).astype(float)
-        values[f"{field}_token_overlap"] = [overlap(set(a.split()), set(b.split()))
+        tokens = {text: set(text.split()) for text in pd.concat([queries[field], targets[field]]).unique()}
+        values[f"{field}_token_overlap"] = [overlap(tokens[a], tokens[b])
                                             for a, b in zip(left[field], right[field])]
         values[f"{field}_missing_left"] = left[field].eq("").astype(float)
         values[f"{field}_missing_right"] = right[field].eq("").astype(float)
@@ -39,7 +40,7 @@ def build_features(queries, targets, pairs, config, vectorizers=None, name_frequ
             from scipy.sparse import csr_matrix
             lm, rm = csr_matrix((len(queries), 1)), csr_matrix((len(targets), 1))
         else:
-            lm = vectorizers[field].transform(queries[f"{field}_folded"])
+            lm = query_matrices[field] if query_matrices is not None else vectorizers[field].transform(queries[f"{field}_folded"])
             rm = vectorizers[field].transform(targets[f"{field}_folded"])
         cosines = []
         for start in range(0, len(pairs), config["batch_size"]):

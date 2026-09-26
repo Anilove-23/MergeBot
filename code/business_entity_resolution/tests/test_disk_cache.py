@@ -115,3 +115,29 @@ def test_full_mode_memory_gate_precedes_raw_dataframe_load(tmp_path, monkeypatch
         pipeline.run(args)
     assert (tmp_path / "output/reports/normalization_cache.json").exists()
     assert not json.loads((tmp_path / "output/reports/memory_estimate.json").read_text())["fits_estimate"]
+
+
+def test_safe_replace_retries_transient_permission_error(tmp_path, monkeypatch):
+    import os
+    from ber.disk_cache import safe_replace
+    src, dst = tmp_path / "src.txt", tmp_path / "dst.txt"
+    src.write_text("hello", encoding="utf-8")
+    attempts = 0
+
+    real_replace = os.replace
+
+    def flaky_replace(s, d):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            err = PermissionError("Access is denied")
+            err.winerror = 5
+            raise err
+        return real_replace(s, d)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    safe_replace(src, dst, max_retries=5, delay=0.01)
+    assert attempts == 3
+    assert dst.read_text(encoding="utf-8") == "hello"
+    assert not src.exists()
+

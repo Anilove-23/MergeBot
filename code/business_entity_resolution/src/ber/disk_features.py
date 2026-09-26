@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 from sklearn.model_selection import KFold
 from tqdm.auto import tqdm
 
-from .disk_cache import atomic_json
+from .disk_cache import atomic_json, safe_replace
 from .features import FEATURE_COLUMNS, build_features
 
 FEATURE_VERSION = 1
@@ -37,10 +37,33 @@ class FeatureStore:
     def query_metadata(self, part):
         return json.loads((self.directory / part['queries']).read_text())
 
+    def blocking_report(self, target_rows=0):
+        total_truth = total_found = 0
+        counts = []
+        for part in self.parts():
+            for q in self.query_metadata(part):
+                total_truth += q['truth_count']
+                total_found += q['found']
+                counts.append(q['candidate_count'])
+        counts = np.array(counts) if counts else np.array([0])
+        queries = len(counts)
+        pairs = self.manifest['rows']
+        return {
+            'candidate_recall': total_found / total_truth if total_truth else 1.0,
+            'true_pairs': total_truth,
+            'retrieved_true_pairs': total_found,
+            'pairs': pairs,
+            'mean': float(counts.mean()),
+            'median': float(np.median(counts)),
+            'p95': float(np.percentile(counts, 95)),
+            'reduction_ratio': 1 - pairs / max(1, queries * target_rows) if target_rows else 1.0
+        }
+
 
 def prepare_features(index, config, cache_root):
     relevant = {k: config.get(k) for k in ['seed', 'folds', 'top_k', 'rare_max_df', 'rare_tokens',
-                                          'disk_query_batch_rows', 'pair_feature_batch_rows', 'tfidf_max_features', 'max_candidates_per_query']}
+                                          'disk_query_batch_rows', 'pair_feature_batch_rows', 'tfidf_max_features',
+                                          'max_candidates_per_query', 'max_block_size', 'block_token_max_df']}
     relevant['train_query_limit'] = config.get('train_query_limit') if index.split == 'train' else None
     key = hashlib.sha256(json.dumps([FEATURE_VERSION, index.directory.name, relevant,
                                     version('rapidfuzz'), version('sparse-dot-topn')], sort_keys=True).encode()).hexdigest()[:24]
@@ -64,7 +87,7 @@ def prepare_features(index, config, cache_root):
                 fold_array[:] = 0
             fold_array.flush()
             del fold_array
-            os.replace(directory / 'query_folds.tmp.npy', fold_path)
+            safe_replace(directory / 'query_folds.tmp.npy', fold_path)
         fold_array = np.load(fold_path, mmap_mode='r')
         selection = None
         limit = relevant['train_query_limit']
@@ -75,56 +98,68 @@ def prepare_features(index, config, cache_root):
         schema = pa.schema([('qid', pa.string()), ('target_id', pa.string()), ('qidx', pa.int64()),
                             ('label', pa.uint8()), ('fold', pa.uint8()), *[(n, pa.float32()) for n in FEATURE_COLUMNS]])
         atomic_json(manifest_path, manifest)
+        read_batch = config.get('disk_query_batch_rows', 64) if selection is None else min(10_000, cached_queries.manifest['identity']['chunk_rows'])
+        sub_batch = config.get('disk_query_batch_rows', 64)
         with tqdm(total=cached_queries.rows, initial=manifest['queries'], desc=f'{index.split} candidates/features', unit='query') as progress:
-            for queries in cached_queries.iter_batches(batch_rows=config.get('disk_query_batch_rows', 64), start_row=manifest['queries']):
-                queries = queries.reset_index(drop=True)
+            for chunk_frame in cached_queries.iter_batches(batch_rows=read_batch, start_row=manifest['queries']):
+                chunk_frame = chunk_frame.reset_index(drop=True)
                 start = manifest['queries']
-                scanned = len(queries)
+                scanned = len(chunk_frame)
                 query_indices = np.arange(start, start + scanned)
                 if selection is not None:
                     keep = selection[query_indices]
-                    queries = queries.loc[keep].reset_index(drop=True)
-                    query_indices = query_indices[keep]
-                if queries.empty:
+                    selected_frame = chunk_frame.loc[keep].reset_index(drop=True)
+                    selected_indices = query_indices[keep]
+                else:
+                    selected_frame = chunk_frame
+                    selected_indices = query_indices
+                if selected_frame.empty:
                     manifest['queries'] = start + scanned
                     atomic_json(manifest_path, manifest)
                     progress.update(scanned)
                     continue
-                number = manifest['done']
-                pairs = index.retrieve(queries, config)
-                counts = pairs.q.value_counts()
-                truth = index.truth(queries.entity_id)
-                found = np.zeros(len(queries), dtype=np.int64)
-                frequency = {name: index.db.execute('SELECT COUNT(*) FROM records WHERE name=?', (name,)).fetchone()[0] for name in set(queries.name)}
-                filename = f'part-{number:06d}.parquet'
-                temporary = directory / f'{filename}.tmp'
-                with pq.ParquetWriter(temporary, schema=schema, compression='zstd') as writer:
-                    for begin in range(0, len(pairs), config.get('pair_feature_batch_rows', 20_000)):
-                        part = pairs.iloc[begin:begin + config.get('pair_feature_batch_rows', 20_000)].copy().reset_index(drop=True)
-                        targets, mapping = index.records(part.rid)
-                        part['t'] = part.rid.map(mapping).astype(np.int64)
-                        features = build_features(queries, targets, part, config, vectorizers=global_vecs,
-                                                  name_frequencies=frequency, candidate_counts=counts)
-                        qids = queries.entity_id.to_numpy()[part.q]
-                        tids = targets.entity_id.to_numpy()[part.t]
-                        labels = np.array([t in truth[q] for q, t in zip(qids, tids)], dtype=np.uint8)
-                        np.add.at(found, part.q.to_numpy(), labels)
-                        features.insert(0, 'fold', np.asarray(fold_array[query_indices[part.q.to_numpy()]]))
-                        features.insert(0, 'label', labels)
-                        features.insert(0, 'qidx', query_indices[part.q.to_numpy()])
-                        features.insert(0, 'target_id', tids)
-                        features.insert(0, 'qid', qids)
-                        writer.write_table(pa.Table.from_pandas(features, schema=schema, preserve_index=False))
-                os.replace(temporary, directory / filename)
-                query_file = f'queries-{number:06d}.json'
-                query_meta = [{'qid': row.entity_id, 'qidx': int(query_indices[i]), 'country': row.country,
-                               'truth_count': len(truth[row.entity_id]), 'found': int(found[i]),
-                               'candidate_count': int(counts.get(i, 0)), 'fold': int(fold_array[query_indices[i]])}
-                              for i, row in enumerate(queries.itertuples())]
-                atomic_json(directory / query_file, query_meta)
-                spec = {'file': filename, 'queries': query_file, 'rows': len(pairs), 'query_count': len(queries), 'qstart': start, 'qstop': start + scanned}
-                atomic_json(directory / f'part-{number:06d}.json', spec)
-                manifest.update(done=number + 1, rows=manifest['rows'] + len(pairs), queries=start + scanned)
+                for sub_start in range(0, len(selected_frame), sub_batch):
+                    sub_end = min(len(selected_frame), sub_start + sub_batch)
+                    queries = selected_frame.iloc[sub_start:sub_end].reset_index(drop=True)
+                    sub_qindices = selected_indices[sub_start:sub_end]
+                    number = manifest['done']
+                    pairs = index.retrieve(queries, config)
+                    counts = pairs.q.value_counts()
+                    truth = index.truth(queries.entity_id)
+                    found = np.zeros(len(queries), dtype=np.int64)
+                    query_matrices = {field: vec.transform(queries[f'{field}_folded'])
+                                      for field, vec in global_vecs.items() if vec is not None}
+                    frequency = {name: index.db.execute('SELECT COUNT(*) FROM records WHERE name=?', (name,)).fetchone()[0] for name in set(queries.name)}
+                    filename = f'part-{number:06d}.parquet'
+                    temporary = directory / f'{filename}.tmp'
+                    with pq.ParquetWriter(temporary, schema=schema, compression='zstd') as writer:
+                        for begin in range(0, len(pairs), config.get('pair_feature_batch_rows', 20_000)):
+                            part = pairs.iloc[begin:begin + config.get('pair_feature_batch_rows', 20_000)].copy().reset_index(drop=True)
+                            targets, mapping = index.records(part.rid)
+                            part['t'] = part.rid.map(mapping).astype(np.int64)
+                            features = build_features(queries, targets, part, config, vectorizers=global_vecs,
+                                                      name_frequencies=frequency, candidate_counts=counts, query_matrices=query_matrices)
+                            qids = queries.entity_id.to_numpy()[part.q]
+                            tids = targets.entity_id.to_numpy()[part.t]
+                            labels = np.array([t in truth[q] for q, t in zip(qids, tids)], dtype=np.uint8)
+                            np.add.at(found, part.q.to_numpy(), labels)
+                            features.insert(0, 'fold', np.asarray(fold_array[sub_qindices[part.q.to_numpy()]]))
+                            features.insert(0, 'label', labels)
+                            features.insert(0, 'qidx', sub_qindices[part.q.to_numpy()])
+                            features.insert(0, 'target_id', tids)
+                            features.insert(0, 'qid', qids)
+                            writer.write_table(pa.Table.from_pandas(features, schema=schema, preserve_index=False))
+                    safe_replace(temporary, directory / filename)
+                    query_file = f'queries-{number:06d}.json'
+                    query_meta = [{'qid': row.entity_id, 'qidx': int(sub_qindices[i]), 'country': row.country,
+                                   'truth_count': len(truth[row.entity_id]), 'found': int(found[i]),
+                                   'candidate_count': int(counts.get(i, 0)), 'fold': int(fold_array[sub_qindices[i]])}
+                                  for i, row in enumerate(queries.itertuples())]
+                    atomic_json(directory / query_file, query_meta)
+                    spec = {'file': filename, 'queries': query_file, 'rows': len(pairs), 'query_count': len(queries), 'qstart': int(sub_qindices[0]), 'qstop': int(sub_qindices[-1]) + 1}
+                    atomic_json(directory / f'part-{number:06d}.json', spec)
+                    manifest.update(done=number + 1, rows=manifest['rows'] + len(pairs))
+                manifest['queries'] = start + scanned
                 atomic_json(manifest_path, manifest)
                 progress.update(scanned)
         manifest['complete'] = True

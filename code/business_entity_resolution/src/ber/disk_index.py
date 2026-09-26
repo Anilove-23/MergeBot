@@ -1,11 +1,14 @@
 """Disk indexes and memory-mapped TF-IDF postings; no all-target DataFrame."""
 from contextlib import closing
+from concurrent.futures import ProcessPoolExecutor
+from collections import deque
 import hashlib
 from importlib.metadata import version
 import json
 import os
 from pathlib import Path
 import sqlite3
+import time
 
 import joblib
 import numpy as np
@@ -15,9 +18,63 @@ from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sparse_dot_topn import api as sparse_api
 from tqdm.auto import tqdm
 
-from .disk_cache import atomic_json
+from .disk_cache import atomic_json, safe_replace
 
 INDEX_VERSION = 2
+
+
+def _index_chunk(frame, source, row_start):
+    """CPU preparation only: workers never open or write the shared database."""
+    records, tokens, numbers, terms = [], [], [], []
+    for local, record in enumerate(frame.to_dict('records')):
+        rid = row_start + local
+        record['numbers'] = sorted(record['numbers'])
+        records.append((rid, source, record['entity_id'], record['name'], json.dumps(record, ensure_ascii=False)))
+        tokens.extend((source, token, rid) for token in sorted(set(record['name_folded'].split())))
+        numbers.extend((source, token, rid) for token in record['numbers'])
+    for field in ['name', 'address']:
+        vectorizer = CountVectorizer(analyzer='char_wb', ngram_range=(2, 4))
+        try:
+            matrix = vectorizer.fit_transform(frame[f'{field}_folded'])
+        except ValueError as exc:
+            if 'empty vocabulary' in str(exc):
+                continue
+            raise
+        dfs = np.asarray(matrix.getnnz(axis=0)).ravel()
+        tfs = np.asarray(matrix.sum(axis=0)).ravel()
+        terms.extend((source, field, term, int(df), int(tf))
+                     for term, df, tf in zip(vectorizer.get_feature_names_out(), dfs, tfs))
+    # Primary-key order reduces random B-tree page revisits in a large database.
+    # Sorting is confined to one chunk and leaves records/rids and DF/TF unchanged.
+    tokens.sort()
+    numbers.sort()
+    terms.sort(key=lambda row: row[:3])
+    return records, tokens, numbers, terms
+
+
+def _prepared_chunks(cached, source, offset, done, workers):
+    # Do not read already committed Parquet partitions on restart.
+    row_start = sum(part['rows'] for part in cached.manifest['parts'][:done])
+    workers = min(workers, max(1, len(cached.manifest['parts']) - done))
+    frames = cached.iter_batches(batch_rows=cached.manifest['identity']['chunk_rows'], start_row=row_start)
+    if workers == 1:
+        for frame in frames:
+            yield _index_chunk(frame, source, offset + row_start)
+            row_start += len(frame)
+        return
+    if done == len(cached.manifest['parts']):
+        return
+    # executor.map eagerly submits all inputs on Python 3.12. This bounded queue
+    # holds at most `workers` chunks, and yields in source order for safe resume.
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        pending = deque()
+        for frame in frames:
+            pending.append(pool.submit(_index_chunk, frame, source, offset + row_start))
+            row_start += len(frame)
+            if len(pending) == workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
 
 def mapped_topn(left, right, top_k, threads):
@@ -43,6 +100,8 @@ def mapped_topn(left, right, top_k, threads):
 
 def connect(path):
     connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA cache_size=-32768")
     connection.execute("PRAGMA temp_store=FILE")
     connection.execute("PRAGMA foreign_keys=ON")
@@ -58,7 +117,12 @@ def _put(connection, key, value):
     connection.execute("INSERT OR REPLACE INTO progress VALUES (?,?)", (key, json.dumps(value)))
 
 
-def build_index(prepared, split, root, cache_root):
+def build_index(prepared, split, root, cache_root, config=None):
+    config = config or {}
+    workers = config.get('index_workers', 2)
+    cache_mb = config.get('index_cache_mb', 128)
+    if not isinstance(workers, int) or workers < 1 or not isinstance(cache_mb, int) or cache_mb < 1:
+        raise ValueError('index_workers and index_cache_mb must be positive integers')
     identity = [INDEX_VERSION, version('scikit-learn'), *[prepared[f"{split}_source{i}"].directory.name for i in [1, 2, 3]]]
     if split == "train":
         from .disk_cache import source_digest
@@ -69,6 +133,7 @@ def build_index(prepared, split, root, cache_root):
     database = directory / "index.sqlite"
     from filelock import FileLock
     with FileLock(str(directory / "writer.lock")), closing(connect(database)) as db:
+        db.execute(f'PRAGMA cache_size=-{cache_mb * 1024}')
         db.executescript("""
           CREATE TABLE IF NOT EXISTS progress(key TEXT PRIMARY KEY,value TEXT);
           CREATE TABLE IF NOT EXISTS records(rid INTEGER PRIMARY KEY,source INTEGER,entity_id TEXT UNIQUE,name TEXT,payload TEXT);
@@ -89,34 +154,24 @@ def build_index(prepared, split, root, cache_root):
         for source in [2, 3]:
             cached = prepared[f"{split}_source{source}"]
             done = _get(db, f"source{source}")
-            row_start = 0
-            for part_no, frame in enumerate(tqdm(cached.iter_batches(batch_rows=cached.manifest['identity']['chunk_rows']),
-                                                desc=f"Index {split}/source{source}", total=len(cached.manifest['parts']))):
-                if part_no < done:
-                    row_start += len(frame)
-                    continue
-                # Each SQLite transaction is a resumable source chunk.
-                with db:
-                    for local, record in enumerate(frame.to_dict("records")):
-                        rid = offset + row_start + local
-                        record["numbers"] = sorted(record["numbers"])
-                        db.execute("INSERT INTO records VALUES (?,?,?,?,?)", (rid, source, record['entity_id'], record['name'], json.dumps(record, ensure_ascii=False)))
-                        db.executemany("INSERT INTO tokens VALUES (?,?,?)", ((source, token, rid) for token in set(record['name_folded'].split())))
-                        db.executemany("INSERT INTO numbers VALUES (?,?,?)", ((source, token, rid) for token in record['numbers']))
-                    for field in ['name', 'address']:
-                        vectorizer = CountVectorizer(analyzer='char_wb', ngram_range=(2, 4))
-                        try:
-                            matrix = vectorizer.fit_transform(frame[f'{field}_folded'])
-                        except ValueError as exc:
-                            if 'empty vocabulary' in str(exc):
-                                continue
-                            raise
-                        dfs = np.asarray(matrix.getnnz(axis=0)).ravel()
-                        tfs = np.asarray(matrix.sum(axis=0)).ravel()
-                        db.executemany("INSERT INTO terms VALUES (?,?,?,?,?) ON CONFLICT(source,field,term) DO UPDATE SET df=df+excluded.df,tf=tf+excluded.tf",
-                                       ((source, field, term, int(df), int(tf)) for term, df, tf in zip(vectorizer.get_feature_names_out(), dfs, tfs)))
-                    _put(db, f"source{source}", part_no + 1)
-                row_start += len(frame)
+            chunks = _prepared_chunks(cached, source, offset, done, workers)
+            with tqdm(total=len(cached.manifest['parts']), initial=done,
+                      desc=f"Index {split}/source{source}", unit="chunk") as progress:
+                waited = time.perf_counter()
+                for part_no, (records_data, tokens_data, numbers_data, terms_data) in enumerate(chunks, done):
+                    wait_seconds = time.perf_counter() - waited
+                    started = time.perf_counter()
+                    # One transaction commits records, frequencies and resume position.
+                    with db:
+                        db.executemany("INSERT INTO records VALUES (?,?,?,?,?)", records_data)
+                        db.executemany("INSERT INTO tokens VALUES (?,?,?)", tokens_data)
+                        db.executemany("INSERT INTO numbers VALUES (?,?,?)", numbers_data)
+                        db.executemany("INSERT INTO terms VALUES (?,?,?,?,?) ON CONFLICT(source,field,term) DO UPDATE SET df=df+excluded.df,tf=tf+excluded.tf", terms_data)
+                        _put(db, f"source{source}", part_no + 1)
+                    progress.set_postfix(wait=f"{wait_seconds:.2f}s", write=f"{time.perf_counter()-started:.2f}s", workers=workers, refresh=False)
+                    progress.update(1)
+                    del records_data, tokens_data, numbers_data, terms_data
+                    waited = time.perf_counter()
             offset += cached.rows
         if not _get(db, 'token_counts'):
             tqdm.write(f'Aggregate {split} token frequencies on disk')
@@ -124,10 +179,10 @@ def build_index(prepared, split, root, cache_root):
                 db.execute('INSERT OR REPLACE INTO token_counts SELECT source,token,COUNT(*) FROM tokens GROUP BY source,token')
                 _put(db, 'token_counts', True)
         done = _get(db, "queries")
-        start = 0
         cached = prepared[f"{split}_source1"]
-        for i, frame in enumerate(tqdm(cached.iter_batches(batch_rows=cached.manifest['identity']['chunk_rows'], columns=['entity_id', 'country']),
-                                       desc=f"Index {split} queries", total=len(cached.manifest['parts']))):
+        start = sum(p['rows'] for p in cached.manifest['parts'][:done])
+        for i, frame in enumerate(tqdm(cached.iter_batches(batch_rows=cached.manifest['identity']['chunk_rows'], columns=['entity_id', 'country'], start_row=start),
+                                       desc=f"Index {split} queries", initial=done, total=len(cached.manifest['parts'])), done):
             if i >= done:
                 with db:
                     db.executemany("INSERT INTO queries VALUES (?,?,?)", ((start + j, q, c) for j, (q, c) in enumerate(frame.itertuples(index=False, name=None))))
@@ -142,10 +197,14 @@ def build_index(prepared, split, root, cache_root):
                 if i < done:
                     continue
                 with db:
+                    truth_data = []
+                    owners_data = []
                     for qid, text in frame.itertuples(index=False, name=None):
                         matches = sorted(set(filter(None, text.split(','))))
-                        db.execute('INSERT INTO truth VALUES (?,?)', (qid, json.dumps(matches)))
-                        db.executemany('INSERT INTO owners VALUES (?,?)', ((target, qid) for target in matches))
+                        truth_data.append((qid, json.dumps(matches)))
+                        owners_data.extend((target, qid) for target in matches)
+                    db.executemany('INSERT INTO truth VALUES (?,?)', truth_data)
+                    db.executemany('INSERT INTO owners VALUES (?,?)', owners_data)
                     _put(db, 'truth', i + 1)
             if db.execute('SELECT COUNT(*) FROM queries').fetchone()[0] != db.execute('SELECT COUNT(*) FROM truth').fetchone()[0]:
                 raise ValueError('Training ground truth must cover every query')
@@ -217,10 +276,8 @@ class DiskIndex:
                     values = np.lib.format.open_memmap(directory / 'values.npy', mode='w+', dtype=np.float32, shape=(int(ptr[-1]),))
                     indices = np.lib.format.open_memmap(directory / 'indices.npy', mode='w+', dtype=dtype, shape=(int(ptr[-1]),))
                     state = {'done': 0, 'rows': 0, 'positions': np.zeros(len(counts), dtype=np.int64)}
-                for part_no, frame in enumerate(tqdm(source_cache.iter_batches(batch_rows=source_cache.manifest['identity']['chunk_rows'], columns=[f'{field}_folded']),
-                                                     desc=f'Build mapped {self.split}/S{source} {field}', total=len(source_cache.manifest['parts']))):
-                    if part_no < state['done']:
-                        continue
+                for part_no, frame in enumerate(tqdm(source_cache.iter_batches(batch_rows=source_cache.manifest['identity']['chunk_rows'], columns=[f'{field}_folded'], start_row=state['rows']),
+                                                     desc=f'Build mapped {self.split}/S{source} {field}', initial=state['done'], total=len(source_cache.manifest['parts'])), state['done']):
                     chunk = vec.transform(frame[f'{field}_folded']).tocoo()
                     order = np.argsort(chunk.col, kind='stable')
                     cols = chunk.col[order]
@@ -234,7 +291,7 @@ class DiskIndex:
                     indices.flush()
                     state = {'done': part_no + 1, 'rows': state['rows'] + len(frame), 'positions': state['positions'] + local_counts}
                     joblib.dump(state, directory / 'state.tmp')
-                    os.replace(directory / 'state.tmp', state_path)
+                    safe_replace(directory / 'state.tmp', state_path)
                 if not np.array_equal(state['positions'], counts):
                     raise ValueError('TF-IDF postings do not agree with document frequencies')
                 atomic_json(marker, {'rows': source_cache.rows, 'terms': len(counts), 'nnz': int(ptr[-1])})
@@ -254,16 +311,24 @@ class DiskIndex:
     def retrieve(self, queries, config):
         hits = [dict() for _ in range(len(queries))]
         limit = config.get('max_candidates_per_query', 10_000)
+        warned = set()
 
         def add(q, rid, score=0., rank=0):
+            if int(rid) not in hits[q] and len(hits[q]) >= limit:
+                if config.get('strict_candidate_limit', False):
+                    raise MemoryError(f"Query {queries.iloc[q].entity_id} exceeds {limit} candidates. No candidates were silently dropped; inspect this common-name block.")
+                if q not in warned:
+                    warned.add(q)
+                    tqdm.write(f"Warning: Query {queries.iloc[q].entity_id} reached max_candidates_per_query limit ({limit}); capping candidates.")
+                return
             item = hits[q].setdefault(int(rid), [0., 0])
             item[0] = max(item[0], float(score))
             if rank and (not item[1] or rank < item[1]):
                 item[1] = int(rank)
-            if len(hits[q]) > limit:
-                raise MemoryError(f"Query {queries.iloc[q].entity_id} exceeds {limit} candidates. No candidates were silently dropped; inspect this common-name block.")
 
         offset = 0
+        max_block_size = config.get('max_block_size', 500)
+        block_token_max_df = config.get('block_token_max_df', 5000)
         for source in [2, 3]:
             for q, record in enumerate(queries.itertuples()):
                 if record.name:
@@ -279,9 +344,18 @@ class DiskIndex:
                 for _, token in sorted(rare)[:config['rare_tokens']]:
                     for rid, in self.db.execute('SELECT rid FROM tokens WHERE source=? AND token=?', (source, token)):
                         add(q, rid)
+                core_tokens = sorted(set(record.name_core.split())) if hasattr(record, 'name_core') and record.name_core else tokens
                 for number in sorted(record.numbers):
-                    for token in tokens:
-                        for rid, in self.db.execute('SELECT n.rid FROM numbers n JOIN tokens t ON n.source=t.source AND n.rid=t.rid WHERE n.source=? AND n.token=? AND t.token=?', (source, number, token)):
+                    for token in core_tokens:
+                        freq = self.db.execute('SELECT count FROM token_counts WHERE source=? AND token=?', (source, token)).fetchone()
+                        if freq and freq[0] > block_token_max_df:
+                            continue
+                        for rid, in self.db.execute(
+                            'SELECT n.rid FROM numbers n JOIN tokens t '
+                            'ON n.source=t.source AND n.rid=t.rid '
+                            'WHERE n.source=? AND n.token=? AND t.token=? '
+                            'ORDER BY n.rid LIMIT ?', (source, number, token, max_block_size)
+                        ):
                             add(q, rid)
             for field in ['name', 'address']:
                 vec, _ = self.vectorizer(field, source, config.get('tfidf_max_features', 200_000))

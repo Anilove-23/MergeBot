@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import time
 
 from filelock import FileLock
 import pandas as pd
@@ -28,13 +29,30 @@ class MemoryBudgetError(MemoryError):
     """An expected preflight refusal, rather than an allocation failure."""
 
 
+def safe_replace(source, destination, max_retries=30, delay=0.1):
+    """Replace destination atomically, retrying transient Windows file locks (WinError 5 / 32)."""
+    for attempt in range(max_retries):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            is_transient = (
+                getattr(exc, "winerror", None) in (5, 32)
+                or isinstance(exc, PermissionError)
+            )
+            if is_transient and attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                raise
+
+
 def atomic_json(path, value):
     temporary = path.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, ensure_ascii=False)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    safe_replace(temporary, path)
 
 
 def _read_json(path):
@@ -204,7 +222,7 @@ def prepare_source(path, cache_root, chunk_rows=10_000, source=None):
                 pq.write_table(table, temporary, compression="zstd", row_group_size=chunk_rows)
                 with temporary.open("rb+") as handle:
                     os.fsync(handle.fileno())
-                os.replace(temporary, directory / filename)
+                safe_replace(temporary, directory / filename)
                 part = {"file": filename, "rows": len(chunk), "bytes": (directory / filename).stat().st_size,
                         "normalized_memory_bytes": memory_bytes, "raw_memory_bytes": raw_bytes,
                         "missing_counts": {k: int(v) for k, v in chunk.eq("").sum().items()},

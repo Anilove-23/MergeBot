@@ -16,10 +16,15 @@ import numpy as np
 import psutil
 from tqdm.auto import tqdm
 
-from .disk_cache import MemoryBudgetError, atomic_json
+from .disk_cache import MemoryBudgetError, atomic_json, safe_replace
 from .features import FEATURE_COLUMNS
 
 TRAIN_VERSION = 1
+
+
+def model_config(config):
+    """Index performance controls change neither model inputs nor fitted weights."""
+    return {k: v for k, v in config.items() if k not in {'index_workers', 'index_cache_mb'}}
 
 
 class DiskClassifier:
@@ -86,6 +91,7 @@ class MappedSequence(lgb.Sequence):
 
 
 def _memory_preflight(kind, rows, config, budget_gb):
+    gc.collect()
     # Labels, gradients and (for LightGBM) compressed bins remain resident.
     # Feature/raw text matrices are not part of this heap allocation.
     estimate = int(rows * ((len(FEATURE_COLUMNS) + 40) * 1.5 if kind == 'lightgbm' else 40) + 256 * 2**20)
@@ -114,7 +120,7 @@ def fit_disk(kind, matrix, config, fold=None, budget_gb=None):
     selection, metadata = select_rows(matrix, fold, batch_rows)
     if not metadata['rows']:
         raise ValueError('No training candidates in this fold')
-    key = hashlib.sha256(json.dumps([TRAIN_VERSION, kind, config, version(kind)], sort_keys=True).encode()).hexdigest()[:20]
+    key = hashlib.sha256(json.dumps([TRAIN_VERSION, kind, model_config(config), version(kind)], sort_keys=True).encode()).hexdigest()[:20]
     directory = selection / f'model-{key}'
     directory.mkdir(exist_ok=True)
     model_path = directory / 'model.joblib'
@@ -194,7 +200,7 @@ def fit_disk(kind, matrix, config, fold=None, budget_gb=None):
                 else:
                     raise ValueError(f'Unsupported disk model: {kind}')
         joblib.dump(model, directory / 'model.tmp')
-        os.replace(directory / 'model.tmp', model_path)
+        safe_replace(directory / 'model.tmp', model_path)
         atomic_json(directory / 'complete.json', {'kind': kind, 'fold': fold, 'training_device': model.training_device_, **metadata})
     gc.collect()
     return model

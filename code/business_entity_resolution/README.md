@@ -51,6 +51,35 @@ for batch in cached.iter_batches(batch_rows=2000, columns=["entity_id", "name"])
 
 ## Disk-backed retrieval, training and inference
 
+Index text preparation now uses two bounded worker processes while a single writer
+commits SQLite chunks. `index_workers` (default 2, use 1 for serial execution) and
+`index_cache_mb` (default 128 MiB for the writer) are configuration options. At most
+one chunk per worker is queued; worker memory is additional to the database cache.
+Token, number and term inserts are ordered by their database key within each
+chunk to reduce random index-page access as the database grows.
+Progress shows time waiting for prepared data (`wait`) and writing/committing it
+(`write`). If writes dominate, adding workers is unlikely to help. Completed
+source and sparse-matrix partitions are skipped before reading them on resume.
+Feature batches reuse query TF-IDF vectors and tokenize unique records once.
+One remaining chunk uses serial preparation to avoid process startup. A small
+21,000-target benchmark before that startup optimization took 3.4 seconds serial
+and 5.2 seconds with two workers; Windows startup outweighed the parallel gain.
+Full-scale speedup has not been measured. Use `index_workers: 1` for tiny datasets
+or when concurrent workers compete with other applications for memory or I/O.
+
+These performance changes preserve existing index/feature checkpoint identities.
+Changing `n_estimators`, `learning_rate`, `num_leaves`, `max_bin`, model device,
+or index worker/cache settings does **not** rebuild normalization, indexes or pair
+features. Model changes retrain models and rescore predictions. Changing retrieval
+settings such as `top_k` rebuilds features but reuses the index; changing folds or
+seed rebuilds the feature store because it contains fold assignments. Input,
+normalization or chunk-size changes may require rebuilding earlier stages.
+
+An already running Python process retains the implementation it imported. These
+index changes apply on the next invocation; ordinary restart reuses committed
+chunks with the same data, cache directory and chunk size. The ongoing full run
+was not interrupted or restarted to apply these optimizations.
+
 `--execution-mode auto` defaults to disk execution for `--full` and memory
 execution for `--smoke`. To verify the disk path with the existing tiny fixture:
 

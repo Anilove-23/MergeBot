@@ -15,10 +15,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm.auto import tqdm
 
-from .disk_cache import atomic_json, checkpoint_report, prepare_dataset
+from .disk_cache import atomic_json, checkpoint_report, prepare_dataset, safe_replace
 from .disk_features import prepare_features, prepare_matrix
 from .disk_index import build_index
-from .disk_training import TRAIN_VERSION, fit_disk
+from .disk_training import TRAIN_VERSION, fit_disk, model_config
 from .export import package, validate
 from .features import FEATURE_COLUMNS
 from .loading import load_data, write_fixture
@@ -27,7 +27,7 @@ from .loading import load_data, write_fixture
 def predict_saved(model, config, policy, root, output, cache_root, chunk_rows):
     from .disk_cache import prepare_source
     prepared = {f'test_source{i}': prepare_source(root / f'test_source{i}.tsv', cache_root, chunk_rows, source=i) for i in [1, 2, 3]}
-    index = build_index(prepared, 'test', root.parent, cache_root)
+    index = build_index(prepared, 'test', root.parent, cache_root, config)
     try:
         store = prepare_features(index, config, cache_root)
         scores = score_parts(store, [model], config, policy['model'].removeprefix('full_'), oof=False)
@@ -40,7 +40,7 @@ def predict_saved(model, config, policy, root, output, cache_root, chunk_rows):
 
 def score_parts(store, models, config, kind, oof=True):
     # Test scores must also invalidate when training data/model weights change.
-    key = hashlib.sha256(json.dumps([TRAIN_VERSION, config, kind, oof, joblib.hash(models)], sort_keys=True).encode()).hexdigest()[:20]
+    key = hashlib.sha256(json.dumps([TRAIN_VERSION, model_config(config), kind, oof, joblib.hash(models)], sort_keys=True).encode()).hexdigest()[:20]
     directory = store.directory / 'scores' / key
     directory.mkdir(parents=True, exist_ok=True)
     state_path = directory / 'state.json'
@@ -65,7 +65,7 @@ def score_parts(store, models, config, kind, oof=True):
                     scored = frame[['qidx', 'target_id', 'label']].copy()
                     scored['score'] = predictions
                     writer.write_table(pa.Table.from_pandas(scored, schema=schema, preserve_index=False))
-            os.replace(temporary, directory / part['file'])
+            safe_replace(temporary, directory / part['file'])
             state['done'] = number + 1
             atomic_json(state_path, state)
     return directory
@@ -142,8 +142,8 @@ def export_scores(store, score_dir, threshold, output):
                 subset = frame.iloc[groups.get(query['qidx'], [])]
                 mw.writerow([query['qid'], ','.join(sorted(subset.loc[subset.score.ge(threshold), 'target_id']))])
                 cw.writerow([query['qid'], ','.join(sorted(subset.target_id))])
-    os.replace(matching_path.with_suffix('.tsv.tmp'), matching_path)
-    os.replace(candidate_path.with_suffix('.tsv.tmp'), candidate_path)
+    safe_replace(matching_path.with_suffix('.tsv.tmp'), matching_path)
+    safe_replace(candidate_path.with_suffix('.tsv.tmp'), candidate_path)
 
 
 def write_errors(index, store, score_dir, threshold, directory):
@@ -218,8 +218,12 @@ def run(args):
     config = json.loads(Path(args.config or project / 'config/default.json').read_text())
     for name, value in {'disk_query_batch_rows': 64, 'pair_feature_batch_rows': 20_000,
                         'training_batch_rows': 100_000, 'tfidf_max_features': 200_000,
-                        'max_candidates_per_query': 10_000, 'disk_max_depth': 5, 'max_bin': 64}.items():
+                        'max_candidates_per_query': 10_000, 'disk_max_depth': 5, 'max_bin': 64,
+                        'max_block_size': 500, 'block_token_max_df': 5000}.items():
         config.setdefault(name, value)
+    available_cpus = os.cpu_count() or 4
+    safe_threads = min(12, max(1, available_cpus - 2))
+    config['threads'] = min(config.get('threads', safe_threads), safe_threads)
     kinds = config.get('boosted_models', ['lightgbm', 'xgboost'])
     if not kinds or not set(kinds) <= {'lightgbm', 'xgboost'}:
         raise ValueError('Disk mode supports LightGBM and XGBoost')
@@ -241,8 +245,10 @@ def run(args):
         prepared = prepare_dataset(root, args.cache_dir, args.chunk_rows)
         atomic_json(reports / 'normalization_cache.json', checkpoint_report(prepared))
     with stage('Build train indexes and feature checkpoints', timings):
-        train_index = build_index(prepared, 'train', root, args.cache_dir)
+        train_index = build_index(prepared, 'train', root, args.cache_dir, config)
         train_store = prepare_features(train_index, config, args.cache_dir)
+        target_rows = sum(prepared[f'train_source{i}'].rows for i in [2, 3])
+        atomic_json(reports / 'blocking_report.json', train_store.blocking_report(target_rows))
         matrix = prepare_matrix(train_store, config)
     experiments = []
     for kind in kinds:
@@ -285,7 +291,7 @@ def run(args):
     train_index.close()
     del matrix, selected
     with stage('Stream test retrieval, prediction and validation', timings):
-        test_index = build_index(prepared, 'test', root, args.cache_dir)
+        test_index = build_index(prepared, 'test', root, args.cache_dir, config)
         test_store = prepare_features(test_index, config, args.cache_dir)
         for kind in kinds:
             model = joblib.load(artifacts / f'full_{kind}.joblib')

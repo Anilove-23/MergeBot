@@ -11,5 +11,9 @@
   "num_leaves": 15,
   "learning_rate": 0.05,
   "hard_negative_weight": 2.0,
-  "threads": 4
+  "threads": 4,
+  "index_workers": 2,
+  "index_cache_mb": 128,
+  "max_block_size": 500,
+  "block_token_max_df": 5000
 }

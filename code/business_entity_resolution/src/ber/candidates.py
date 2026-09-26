@@ -55,10 +55,15 @@ def generate(queries, targets, config, full=True):
                 for token in rare:
                     for r in sorted(token_index[token]):
                         add(q, r)
-                token_hits = set().union(*(token_index[t] for t in tokens))
-                number_hits = set().union(*(number_index[n] for n in record.numbers))
-                for r in sorted(token_hits & number_hits):
-                    add(q, r)
+                core_tokens = sorted(set(record.name_core.split())) if hasattr(record, 'name_core') and record.name_core else sorted(tokens)
+                max_block_size = config.get('max_block_size', 500)
+                block_token_max_df = config.get('block_token_max_df', 5000)
+                for number in sorted(record.numbers):
+                    for token in core_tokens:
+                        if len(token_index[token]) > block_token_max_df:
+                            continue
+                        for r in sorted(number_index[number] & token_index[token])[:max_block_size]:
+                            add(q, r)
         for field in (["name_folded", "address_folded"] if full else ["name_folded"]):
             left_matrix, right_matrix = vectors(queries, right, field)
             for start in tqdm(range(0, len(queries), config["batch_size"]),
